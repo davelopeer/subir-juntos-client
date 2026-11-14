@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head><meta charset="UTF-8" /><title>Facing test</title>
+    <style>body{margin:0;background:#8fd0f0} canvas{display:block;margin:20px auto;background:linear-gradient(#8fd0f0,#cdeffb)}</style>
+  </head>
+  <body>
+    <canvas id="c" width="760" height="200"></canvas>
+    <script src="js/characters.js?v=f1"></script>
+    <script>
+      var ctx = document.getElementById("c").getContext("2d");
+      CharSprites.load(function(){});
+      function draw(){
+        var now = performance.now();
+        ctx.clearRect(0,0,760,200);
+        var gy=170;
+        ctx.strokeStyle="rgba(0,0,0,.3)";ctx.beginPath();ctx.moveTo(0,gy);ctx.lineTo(760,gy);ctx.stroke();
+        for(var c=0;c<4;c++){
+          var frame=CharSprites.cycleFrame(c,"walk",now);
+          ctx.save(); ctx.translate(90+c*170, gy);
+          CharSprites.drawFrame(ctx,c,"walk",frame,1); // facing=1 => andando p/ DIREITA
+          ctx.restore();
+          ctx.fillStyle="#003";ctx.font="12px sans-serif";ctx.textAlign="center";
+          ctx.fillText(CHARACTERS[c].name,90+c*170,gy+22);
+        }
+        ctx.fillStyle="#003";ctx.font="bold 13px sans-serif";ctx.textAlign="left";
+        ctx.fillText("todos facing=1 (devem olhar/andar para a DIREITA →)",12,20);
+        requestAnimationFrame(draw);
+      }
+      requestAnimationFrame(draw);
+    </script>
+  </body>
+</html>

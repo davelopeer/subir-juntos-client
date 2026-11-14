@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>Grudados — suba junto ou não sobe!</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="stage">
+      <canvas id="game" width="960" height="600"></canvas>
+
+      <!-- Botão de mudo -->
+      <button id="muteBtn" title="Ligar/desligar música">♪</button>
+
+      <!-- Controles de toque (mobile) — só aparecem durante o jogo -->
+      <div id="touch" class="hidden">
+        <div class="pad-left">
+          <button id="btnLeft" class="tbtn" aria-label="Esquerda">◀</button>
+          <button id="btnRight" class="tbtn" aria-label="Direita">▶</button>
+        </div>
+        <div class="pad-right">
+          <button id="btnJump" class="tbtn jump" aria-label="Pular">▲</button>
+        </div>
+      </div>
+
+      <!-- ============ LOBBY (sobreposto ao canvas) ============ -->
+      <div id="overlay">
+        <!-- Tela: escolher nome -->
+        <section id="screen-name" class="panel">
+          <h1 class="logo">GRUDADOS</h1>
+          <p class="tag">Presos pela mesma corda. Subam juntos!</p>
+          <label class="field">
+            <span>Seu nome</span>
+            <input
+              id="nameInput"
+              maxlength="16"
+              placeholder="Ex: Zé da Floresta"
+              autocomplete="off"
+            />
+          </label>
+          <button id="nameOk" class="btn primary">Continuar</button>
+        </section>
+
+        <!-- Tela: criar ou entrar -->
+        <section id="screen-home" class="panel hidden">
+          <h1 class="logo">GRUDADOS</h1>
+          <p class="tag">Olá, <strong id="helloName">jogador</strong>!</p>
+          <button id="createBtn" class="btn primary">Criar sala</button>
+          <div class="or">ou entre numa sala</div>
+          <div class="join-row">
+            <input
+              id="joinInput"
+              maxlength="5"
+              placeholder="CÓDIGO"
+              autocomplete="off"
+              class="code-input"
+            />
+            <button id="joinBtn" class="btn">Entrar</button>
+          </div>
+          <p id="homeError" class="error"></p>
+        </section>
+
+        <!-- Tela: sala de espera -->
+        <section id="screen-room" class="panel hidden">
+          <p class="tag">Sala</p>
+          <div id="roomCode" class="room-code">—</div>
+          <p class="hint">Compartilhe esse código com a galera.</p>
+          <ul id="playerList" class="players"></ul>
+
+          <!-- Seletor de personagem -->
+          <p class="pick-label">Escolha seu personagem</p>
+          <div id="charGrid" class="char-grid"></div>
+
+          <p id="roomStatus" class="hint"></p>
+          <div class="row">
+            <button id="leaveBtn" class="btn ghost">Sair</button>
+            <button id="startBtn" class="btn primary" disabled>Começar</button>
+          </div>
+          <p id="roomError" class="error"></p>
+        </section>
+
+        <!-- Tela: vitória -->
+        <section id="screen-win" class="panel hidden">
+          <h1 class="logo win">SUCESSO!</h1>
+          <p class="tag">Vocês chegaram ao topo juntos!</p>
+          <p id="winTime" class="big"></p>
+          <div class="row">
+            <button id="winLeave" class="btn ghost">Menu</button>
+            <button id="winAgain" class="btn primary">Jogar de novo</button>
+          </div>
+          <p id="winHint" class="hint"></p>
+        </section>
+
+        <!-- Aviso de conexão -->
+        <div id="netBanner" class="net-banner hidden"></div>
+      </div>
+    </div>
+
+    <!-- Scripts clássicos (sem módulos ES), carregados em ordem -->
+    <script src="js/config.js"></script>
+    <script src="js/audio.js"></script>
+    <script src="js/characters.js"></script>
+    <script src="js/net.js"></script>
+    <script src="js/game.js"></script>
+  </body>
+</html>

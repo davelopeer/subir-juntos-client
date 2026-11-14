@@ -1,0 +1,70 @@
+{
+  "cellW": 185,
+  "cellH": 210,
+  "footX": 92,
+  "footY": 198,
+  "standH": 150,
+  "fps": {
+    "idle": 6,
+    "walk": 11,
+    "jump": 10
+  },
+  "chars": [
+    {
+      "idle": {
+        "file": "char1_idle.png",
+        "frames": 7
+      },
+      "walk": {
+        "file": "char1_walk.png",
+        "frames": 7
+      },
+      "jump": {
+        "file": "char1_jump.png",
+        "frames": 8
+      }
+    },
+    {
+      "idle": {
+        "file": "char2_idle.png",
+        "frames": 4
+      },
+      "walk": {
+        "file": "char2_walk.png",
+        "frames": 8
+      },
+      "jump": {
+        "file": "char2_jump.png",
+        "frames": 6
+      }
+    },
+    {
+      "idle": {
+        "file": "char3_idle.png",
+        "frames": 7
+      },
+      "walk": {
+        "file": "char3_walk.png",
+        "frames": 8
+      },
+      "jump": {
+        "file": "char3_jump.png",
+        "frames": 8
+      }
+    },
+    {
+      "idle": {
+        "file": "char4_idle.png",
+        "frames": 6
+      },
+      "walk": {
+        "file": "char4_walk.png",
+        "frames": 8
+      },
+      "jump": {
+        "file": "char4_jump.png",
+        "frames": 8
+      }
+    }
+  ]
+}
