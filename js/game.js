@@ -143,13 +143,15 @@
     ROPE_DAMP: 0.12,
   };
   var STEP_MS = 1000 / 60; // passo fixo da simulação local
-  // Atraso de render p/ interpolar remotos (ms). ADAPTATIVO: cresce quando a
-  // rede tem jitter (buffer maior absorve as rajadas → menos STARVE/travadas)
-  // e volta ao mínimo quando a rede está boa. Trocamos um pouco de latência
-  // visual por fluidez — o certo para um coop sem PvP.
-  var INTERP_DELAY = 110; // valor atual (ajustado 1x/s em frame())
-  var INTERP_DELAY_MIN = 110;
-  var INTERP_DELAY_MAX = 260;
+  // Atraso de interpolação dos remotos, medido em TICKS do servidor (não em ms
+  // de relógio local). Interpolar na linha do tempo do servidor imuniza contra
+  // rajadas de rede: mesmo que 3 snapshots cheguem juntos, eles ficam espaçados
+  // corretamente por tick, então não há o "corre e congela" (STARVE). O valor é
+  // ADAPTATIVO: cresce quando há starve (rede pior) e volta ao mínimo quando
+  // acalma. Troca um pouco de latência visual por fluidez (coop, sem PvP).
+  var DELAY_TICKS = 7; // ~116 ms (ajustado 1x/s em frame())
+  var DELAY_TICKS_MIN = 7;
+  var DELAY_TICKS_MAX = 20; // ~333 ms
   // Limiar de snap: só teleporta a previsão quando a divergência é enorme
   // (renascimento move centenas de px). A esticada da corda e os trancos de
   // perigo ficam abaixo disso e são absorvidos pelo blend suave — sem o
@@ -1071,7 +1073,7 @@
         "/s  buf " +
         diag.bufDepth +
         "  atraso " +
-        Math.round(INTERP_DELAY) +
+        Math.round(DELAY_TICKS * STEP_MS) +
         "ms",
       diagColor(diag.starveRate, 0, 2, true),
     ]);
@@ -1369,10 +1371,16 @@
   }
 
   // ---- Buffer de interpolação dos remotos (Parte C) ----------------
+  // Cada sample é carimbado com o TICK do servidor (não a hora de chegada),
+  // para a interpolação rodar na linha do tempo do servidor (ver sampleBuffer).
   function pushSample(id, t, p) {
     var b = buf[id] || (buf[id] = []);
+    var last = b.length ? b[b.length - 1] : null;
+    // ignora snapshot repetido/fora de ordem (rajada) — evita span de tick 0.
+    if (last && serverTick <= last.tk) return;
     b.push({
-      t: t,
+      tk: serverTick, // tick do servidor deste snapshot
+      t: t, // hora de chegada (só p/ limitar o histórico)
       x: p.x,
       y: p.y,
       facing: p.facing,
@@ -1382,11 +1390,11 @@
     while (b.length > 2 && b[0].t < t - 1000) b.shift(); // ~1s de histórico
   }
 
-  // Posição interpolada de um remoto no instante renderTime (atrasado).
-  function sampleBuffer(id, renderTime) {
+  // Posição interpolada de um remoto no tick de render (atrasado): renderTk.
+  function sampleBuffer(id, renderTk) {
     var b = buf[id];
     if (!b || !b.length) return rpos[id] || null;
-    if (renderTime <= b[0].t) {
+    if (renderTk <= b[0].tk) {
       var f = b[0];
       return {
         x: f.x,
@@ -1401,9 +1409,9 @@
     for (var i = 0; i < b.length - 1; i++) {
       var a = b[i];
       var c = b[i + 1];
-      if (renderTime >= a.t && renderTime <= c.t) {
-        var span = c.t - a.t || 1;
-        var alpha = (renderTime - a.t) / span;
+      if (renderTk >= a.tk && renderTk <= c.tk) {
+        var span = c.tk - a.tk || 1;
+        var alpha = (renderTk - a.tk) / span;
         var pick = alpha < 0.5 ? a : c;
         return {
           x: a.x + (c.x - a.x) * alpha,
@@ -1481,14 +1489,16 @@
       }
       diag.starveRate = Math.round(diag.starveCount / secs);
       diag.snapRate = Math.round(diag.snapCount / secs);
-      // atraso de interpolação adaptativo: cobre ~2 snapshots + folga do jitter.
-      // Se houve STARVE, puxa mais agressivo (o buffer esvaziou de fato).
-      var targetDelay = 90 + diag.jitter * 2.5 + diag.starveRate * 25;
-      if (targetDelay < INTERP_DELAY_MIN) targetDelay = INTERP_DELAY_MIN;
-      if (targetDelay > INTERP_DELAY_MAX) targetDelay = INTERP_DELAY_MAX;
+      // atraso de interpolação adaptativo (em ticks): mínimo quando a rede está
+      // boa; sobe quando houve STARVE (buffer esvaziou de fato) ou jitter alto.
+      var jitterTicks = diag.jitter / STEP_MS; // jitter (ms) → ticks
+      var targetTicks =
+        DELAY_TICKS_MIN + jitterTicks * 1.5 + diag.starveRate * 2;
+      if (targetTicks < DELAY_TICKS_MIN) targetTicks = DELAY_TICKS_MIN;
+      if (targetTicks > DELAY_TICKS_MAX) targetTicks = DELAY_TICKS_MAX;
       // sobe rápido (evita travar já), desce devagar (não "repuxa" os remotos).
-      var k = targetDelay > INTERP_DELAY ? 0.5 : 0.1;
-      INTERP_DELAY += (targetDelay - INTERP_DELAY) * k;
+      var k = targetTicks > DELAY_TICKS ? 0.5 : 0.08;
+      DELAY_TICKS += (targetTicks - DELAY_TICKS) * k;
       // BUFFER: profundidade média dos buffers de interpolação dos remotos.
       var bSum = 0,
         bN = 0;
@@ -1533,12 +1543,12 @@
           grounded: me.grounded,
         };
       }
-      // Parte C: remotos interpolados com atraso de render.
-      var renderTime = ts - INTERP_DELAY;
+      // Parte C: remotos interpolados N ticks atrás do relógio do servidor.
+      var renderTk = renderTick - DELAY_TICKS;
       for (var i = 0; i < order.length; i++) {
         var id = order[i];
         if (id === youId) continue;
-        var s = sampleBuffer(id, renderTime);
+        var s = sampleBuffer(id, renderTk);
         if (s) rpos[id] = s;
       }
       updateCameraAndMeters();
