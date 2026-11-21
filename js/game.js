@@ -54,7 +54,19 @@
   var rpos = {}; // id -> posição renderizada (suavizada)
   var cam = { x: 0, y: 0 };
   var elapsed = 0;
-  var tick = 0;
+
+  // ---- Relógio de render (corrige a "travada" cosmética) -----------
+  // ANTES: uma única variável `tick` era incrementada a cada quadro de
+  // render (~60/s) E sobrescrita a cada snapshot (~30/s). Como as duas
+  // cadências não batem (e têm jitter), o `tick` ficava não-monotônico e
+  // TUDO que é desenhado a partir dele pulava: nuvens, pêndulos, pássaros,
+  // brilho da porta, asa… (por isso "até as nuvens travam e reaparecem").
+  // AGORA: `serverTick` guarda o tick autoritativo do último snapshot e
+  // `renderTick` (float) avança por TEMPO REAL, apenas seguindo de perto o
+  // servidor — suave e sem serrilhado, mas ainda sincronizado com os perigos.
+  var serverTick = 0; // tick do último snapshot (autoritativo)
+  var serverTickAt = 0; // performance.now() de quando o snapshot chegou
+  var renderTick = 0; // relógio suave usado SÓ para desenhar
 
   // HUD de altitude
   var bestMeters = 0;
@@ -63,6 +75,47 @@
 
   // Perigos: mesma margem usada no servidor para os pássaros "darem a volta".
   var BIRD_MARGIN = 80;
+
+  // ---- HUD de diagnóstico (ping / FPS / travadas) -------------------
+  // Fica sempre na tela para o jogador conseguir reportar onde está o
+  // gargalo: render do próprio aparelho, rede, ou o servidor. Tecla "P"
+  // esconde/mostra.
+  var diag = {
+    show: true,
+    frames: 0, // frames desde a última amostragem
+    fps: 0, // quadros por segundo (render local)
+    stateCount: 0, // snapshots recebidos desde a última amostragem
+    stateRate: 0, // snapshots/s vindos do servidor (ideal ~30)
+    lastStateAt: 0, // instante do último snapshot (p/ medir intervalos)
+    gapMax: 0, // maior intervalo entre snapshots na janela (ms) → travadas
+    gapMaxShown: 0, // valor exibido (decai devagar p/ picos ficarem visíveis)
+    lastSampleAt: 0, // instante da última amostragem de 1 s
+    rxMsgs: 0, // snapshot anterior do contador de mensagens
+    rxBytes: 0, // snapshot anterior do contador de bytes
+    kbps: 0, // tráfego de entrada (KB/s)
+
+    // --- métricas que apontam a CAMADA do problema -----------------
+    // JITTER: desvio-padrão do intervalo entre snapshots. Alto = rede
+    // instável → o buffer de interpolação dos remotos sofre.
+    gapSum: 0,
+    gapSqSum: 0,
+    gapN: 0,
+    jitter: 0,
+    // STARVE: vezes/s que o buffer de um remoto esvaziou (congela e pula).
+    starveCount: 0,
+    starveRate: 0,
+    // SNAP: teleportes do PRÓPRIO boneco (reconciliação dura) e a última
+    // divergência em px (mostra o quão perto do limiar de snap você anda).
+    snapCount: 0,
+    snapRate: 0,
+    lastDrift: 0,
+    // JANK: pior quadro único da janela (ms). Alto = engasgo do aparelho.
+    jankMax: 0,
+    jankShown: 0,
+    // BUFFER: profundidade média do buffer de interpolação dos remotos.
+    bufDepth: 0,
+    // VEREDITO: camada mais provável do gargalo (heurística, no drawDiag).
+  };
 
   // Entrada local do jogador
   var input = { left: false, right: false, jump: false };
@@ -165,12 +218,25 @@
   });
 
   GameNet.on("state", function (msg) {
-    tick = msg.tick;
+    var now = performance.now();
+    // tick autoritativo p/ o relógio de render seguir (ver renderTick).
+    serverTick = msg.tick;
+    serverTickAt = now;
     elapsed = msg.elapsed;
     order = msg.players.map(function (p) {
       return p.id;
     });
-    var now = performance.now();
+    // diagnóstico: conta snapshots, mede o maior intervalo entre eles
+    // (gap grande = "travada") e acumula p/ o desvio-padrão (JITTER).
+    diag.stateCount++;
+    if (diag.lastStateAt) {
+      var gap = now - diag.lastStateAt;
+      if (gap > diag.gapMax) diag.gapMax = gap;
+      diag.gapSum += gap;
+      diag.gapSqSum += gap * gap;
+      diag.gapN++;
+    }
+    diag.lastStateAt = now;
     msg.players.forEach(function (p) {
       targets[p.id] = p;
       if (p.id === youId) {
@@ -461,6 +527,14 @@
     refreshInput();
   });
 
+  // "P" liga/desliga o HUD de diagnóstico (em qualquer tela, menos ao digitar).
+  window.addEventListener("keydown", function (e) {
+    if (e.code !== "KeyP") return;
+    var el = document.activeElement;
+    if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
+    diag.show = !diag.show;
+  });
+
   // ============================================================
   //  Entrada: toque (mobile)
   // ============================================================
@@ -525,7 +599,7 @@
     ctx.fill();
     ctx.restore();
 
-    var cloudOff = (tick * 0.2) % (VIEW_W + 200);
+    var cloudOff = (renderTick * 0.2) % (VIEW_W + 200);
     drawCloud(120 - cloudOff + cam.x * -0.05, 90, 1);
     drawCloud(520 - cloudOff + cam.x * -0.05, 150, 0.8);
     drawCloud(820 - cloudOff + cam.x * -0.05, 70, 1.1);
@@ -632,7 +706,7 @@
     if (!world.pendulums) return;
     for (var i = 0; i < world.pendulums.length; i++) {
       var pd = world.pendulums[i];
-      var b = pendulumPos(pd, tick);
+      var b = pendulumPos(pd, renderTick);
       // viga/âncora
       ctx.fillStyle = "#5a4630";
       ctx.fillRect(pd.ax - 18, pd.ay - 8, 36, 8);
@@ -669,8 +743,8 @@
     if (!world.birds) return;
     for (var i = 0; i < world.birds.length; i++) {
       var bd = world.birds[i];
-      var x = birdX(bd, tick, world.worldW);
-      var y = bd.y + Math.sin(tick * 0.2 + bd.phase) * 4;
+      var x = birdX(bd, renderTick, world.worldW);
+      var y = bd.y + Math.sin(renderTick * 0.2 + bd.phase) * 4;
       drawBird(x, y, bd.dir);
     }
   }
@@ -697,7 +771,7 @@
     ctx.closePath();
     ctx.fill();
     // asa batendo
-    var flap = Math.sin(tick * 0.3) * 10;
+    var flap = Math.sin(renderTick * 0.3) * 10;
     ctx.fillStyle = "#2f3237";
     ctx.beginPath();
     ctx.moveTo(-2, -2);
@@ -719,7 +793,7 @@
       d.y + d.h / 2,
       80,
     );
-    var pulse = 0.35 + Math.sin(tick * 0.06) * 0.15;
+    var pulse = 0.35 + Math.sin(renderTick * 0.06) * 0.15;
     glow.addColorStop(0, "rgba(255,230,120," + pulse + ")");
     glow.addColorStop(1, "rgba(255,230,120,0)");
     ctx.fillStyle = glow;
@@ -865,7 +939,7 @@
     if (meters > bestMeters) bestMeters = meters;
     if (bestMeters >= milestone + 100) {
       milestone = Math.floor(bestMeters / 100) * 100;
-      banner = { text: milestone + " m!", t: tick };
+      banner = { text: milestone + " m!", t: renderTick };
     }
   }
 
@@ -895,7 +969,7 @@
     ctx.restore();
 
     // banner de marco a cada 100 m (fica ~1.5s)
-    var age = tick - banner.t;
+    var age = renderTick - banner.t;
     if (banner.text && age < 90) {
       var a = age < 15 ? age / 15 : age > 75 ? (90 - age) / 15 : 1;
       ctx.save();
@@ -906,6 +980,152 @@
       ctx.fillText(banner.text, VIEW_W / 2, 120);
       ctx.restore();
     }
+  }
+
+  // ---- HUD de diagnóstico (desenhado por cima de tudo) --------------
+  // Cada métrica ganha cor (verde/amarelo/vermelho) para o jogador ver
+  // num relance QUAL camada está ruim:
+  //   FPS baixo       → o aparelho/navegador dele não dá conta do render;
+  //   PING alto        → latência de rede até o servidor;
+  //   REDE < ~30/s     → snapshots não chegam (rede ruim ou servidor cheio);
+  //   TRAVA alta       → houve um "soluço" (maior buraco entre snapshots);
+  //   LOOP (servidor)  → o event loop do servidor está atrasado p/ todos.
+  function diagColor(value, good, warn, invert) {
+    // invert=false: maior é melhor | invert=true: menor é melhor
+    if (invert)
+      return value <= good ? "#8ede7f" : value <= warn ? "#ffe14d" : "#ff6b6b";
+    return value >= good ? "#8ede7f" : value >= warn ? "#ffe14d" : "#ff6b6b";
+  }
+
+  // Heurística de "onde está o gargalo". Olha as métricas piores e nomeia a
+  // camada provável, para o jogador não precisar interpretar número por número.
+  function computeVerdict(s) {
+    // fora da partida não há snapshots → métricas de rede não se aplicam.
+    if (phase !== "playing") return ["— (em jogo)", "rgba(255,255,255,0.5)"];
+    if (diag.fps < 30 || diag.jankShown > 100)
+      return ["aparelho (render)", "#ff6b6b"];
+    if (s.server && s.server.simGap > 20) return ["servidor (loop)", "#ff6b6b"];
+    if (diag.jitter > 35 || diag.starveRate > 2 || diag.stateRate < 20)
+      return ["rede (jitter/perda)", "#ffe14d"];
+    if (diag.snapRate > 1) return ["previsão (snap)", "#ffe14d"];
+    if (s.ping != null && s.pingAvg > 160)
+      return ["latência (rede)", "#ffe14d"];
+    return ["sem gargalo", "#8ede7f"];
+  }
+
+  function drawDiag() {
+    if (!diag.show) return;
+    var s = GameNet.stats();
+    var lines = [];
+
+    // headline: camada mais provável do problema (leitura num relance)
+    var verdict = computeVerdict(s);
+    lines.push(["PROVÁVEL", verdict[0], verdict[1]]);
+
+    // --- aparelho (render local) ---
+    lines.push(["FPS", String(diag.fps), diagColor(diag.fps, 50, 30, false)]);
+    lines.push([
+      "JANK",
+      Math.round(diag.jankShown) + " ms",
+      diagColor(diag.jankShown, 30, 80, true),
+    ]);
+
+    // --- rede ---
+    if (s.ping == null) {
+      lines.push(["PING", GameNet.isConnected() ? "…" : "offline", "#ff6b6b"]);
+    } else {
+      lines.push([
+        "PING",
+        s.ping + " ms  (méd " + s.pingAvg + " / máx " + s.pingMax + ")",
+        diagColor(s.ping, 80, 160, true),
+      ]);
+    }
+    lines.push([
+      "REDE",
+      diag.stateRate + "/s   " + diag.kbps.toFixed(1) + " KB/s",
+      diagColor(diag.stateRate, 25, 15, false),
+    ]);
+    lines.push([
+      "JITTER",
+      diag.jitter + " ms",
+      diagColor(diag.jitter, 15, 35, true),
+    ]);
+    lines.push([
+      "TRAVA",
+      Math.round(diag.gapMaxShown) + " ms",
+      diagColor(diag.gapMaxShown, 80, 200, true),
+    ]);
+
+    // --- netcode (previsão + interpolação) ---
+    lines.push([
+      "STARVE",
+      diag.starveRate + "/s   buf " + diag.bufDepth,
+      diagColor(diag.starveRate, 0, 2, true),
+    ]);
+    lines.push([
+      "SNAP",
+      diag.snapRate + "/s   drift " + diag.lastDrift + " px",
+      diagColor(diag.snapRate, 0, 1, true),
+    ]);
+
+    // --- servidor --- (tolerante a servidor antigo que não manda os campos)
+    if (s.server) {
+      var sv = s.server;
+      var q = function (v) {
+        return v != null ? v : "?";
+      };
+      lines.push([
+        "SERVIDOR",
+        "loop +" +
+          q(sv.simGap) +
+          " ms  passo " +
+          q(sv.simMs) +
+          "/" +
+          q(sv.simMsMax) +
+          " ms",
+        sv.simGap != null
+          ? diagColor(sv.simGap, 5, 20, true)
+          : "rgba(255,255,255,0.5)",
+      ]);
+      lines.push([
+        "SALAS",
+        q(sv.playing) +
+          "/" +
+          q(sv.rooms) +
+          "  jog " +
+          q(sv.players) +
+          (sv.rss != null ? "  " + sv.rss + "MB" : ""),
+        "rgba(255,255,255,0.8)",
+      ]);
+    }
+
+    // caixa
+    var padX = 10;
+    var lineH = 16;
+    var w = 252;
+    var h = 12 + lines.length * lineH + 12;
+    var x = VIEW_W - w - 10;
+    var y = 44;
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    roundRect(x, y, w, h, 8);
+    ctx.fill();
+
+    ctx.font = "10px Trebuchet MS";
+    ctx.textAlign = "left";
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillText("DIAGNÓSTICO  (P esconde)", x + padX, y + 12);
+
+    var ty = y + 12 + lineH;
+    for (var i = 0; i < lines.length; i++) {
+      ctx.font = "bold 11px Trebuchet MS";
+      ctx.fillStyle = "rgba(255,255,255,0.65)";
+      ctx.fillText(lines[i][0], x + padX, ty);
+      ctx.fillStyle = lines[i][2];
+      ctx.fillText(lines[i][1], x + padX + 64, ty);
+      ty += lineH;
+    }
+    ctx.restore();
   }
 
   function renderPlay() {
@@ -1117,8 +1337,11 @@
   function reconcile(m, p) {
     var dx = p.x - m.x;
     var dy = p.y - m.y;
+    // diagnóstico: divergência atual (px) entre previsão e servidor.
+    diag.lastDrift = Math.round(Math.sqrt(dx * dx + dy * dy));
     if (dx * dx + dy * dy > SNAP_DIST * SNAP_DIST) {
-      // divergência grande (corda/hazard/respawn): snap direto
+      // divergência grande (corda/hazard/respawn): snap direto = teleporte
+      diag.snapCount++;
       m.x = p.x;
       m.y = p.y;
       m.prevY = p.y;
@@ -1180,7 +1403,10 @@
         };
       }
     }
-    var last = b[b.length - 1]; // starved: usa o mais recente
+    // starved: o render "passou" do sample mais novo (buffer vazio) → o
+    // remoto congela aqui e vai "pular" quando o próximo snapshot chegar.
+    diag.starveCount++;
+    var last = b[b.length - 1]; // usa o mais recente
     return {
       x: last.x,
       y: last.y,
@@ -1196,11 +1422,72 @@
   //  Loop principal
   // ============================================================
   function frame(ts) {
-    tick++;
     if (ts == null) ts = performance.now();
     var dt = lastFrameTs == null ? 0 : ts - lastFrameTs;
     lastFrameTs = ts;
+    // JANK: pior quadro único (medido ANTES do clamp p/ não mascarar engasgos).
+    if (dt > diag.jankMax) diag.jankMax = dt;
     if (dt > 250) dt = 250; // após aba em 2º plano, evita "catch-up" enorme
+
+    // Relógio de render suave: avança por tempo real e segue de perto o tick
+    // do servidor (extrapolando desde o último snapshot). Sem o serrilhado do
+    // antigo `tick++`, que fazia nuvens/perigos pularem a cada snapshot.
+    if (serverTickAt) {
+      var tgt = serverTick + (ts - serverTickAt) / STEP_MS;
+      var dTick = tgt - renderTick;
+      if (dTick > 8 || dTick < -8)
+        renderTick = tgt; // resync duro (aba voltou / lag grande)
+      else renderTick += dTick * 0.1; // aproxima suave
+    } else {
+      renderTick += dt / STEP_MS; // antes do 1º snapshot
+    }
+
+    // Amostragem das métricas de diagnóstico, uma vez por segundo.
+    diag.frames++;
+    if (!diag.lastSampleAt) diag.lastSampleAt = ts;
+    var sampleDt = ts - diag.lastSampleAt;
+    if (sampleDt >= 1000) {
+      var secs = sampleDt / 1000;
+      diag.fps = Math.round(diag.frames / secs);
+      diag.stateRate = Math.round(diag.stateCount / secs);
+      var st = GameNet.stats();
+      diag.kbps = (st.rxBytes - diag.rxBytes) / secs / 1024;
+      diag.rxBytes = st.rxBytes;
+      diag.rxMsgs = st.rxMsgs;
+      // pico de "travada" decai ao longo de alguns segundos p/ ficar visível
+      diag.gapMaxShown = Math.max(diag.gapMax, diag.gapMaxShown * 0.5);
+      diag.jankShown = Math.max(diag.jankMax, diag.jankShown * 0.5);
+      // JITTER: desvio-padrão do intervalo entre snapshots na janela.
+      if (diag.gapN > 1) {
+        var mean = diag.gapSum / diag.gapN;
+        var variance = diag.gapSqSum / diag.gapN - mean * mean;
+        diag.jitter = Math.round(Math.sqrt(Math.max(0, variance)));
+      } else {
+        diag.jitter = 0;
+      }
+      diag.starveRate = Math.round(diag.starveCount / secs);
+      diag.snapRate = Math.round(diag.snapCount / secs);
+      // BUFFER: profundidade média dos buffers de interpolação dos remotos.
+      var bSum = 0,
+        bN = 0;
+      for (var bid in buf) {
+        if (bid === youId) continue;
+        bSum += buf[bid].length;
+        bN++;
+      }
+      diag.bufDepth = bN ? Math.round((bSum / bN) * 10) / 10 : 0;
+      // zera os acumuladores da janela
+      diag.gapMax = 0;
+      diag.jankMax = 0;
+      diag.gapSum = 0;
+      diag.gapSqSum = 0;
+      diag.gapN = 0;
+      diag.starveCount = 0;
+      diag.snapCount = 0;
+      diag.frames = 0;
+      diag.stateCount = 0;
+      diag.lastSampleAt = ts;
+    }
 
     if ((phase === "playing" || phase === "win") && world) {
       // Parte B: avança a previsão do jogador local em passo fixo de 60 Hz.
@@ -1238,6 +1525,8 @@
       renderLobbyBg();
       if (phase === "room") animatePreviews(performance.now());
     }
+
+    drawDiag(); // por cima de tudo, em qualquer tela
 
     requestAnimationFrame(frame);
   }
