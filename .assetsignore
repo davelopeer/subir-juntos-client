@@ -1,6 +1,9 @@
+node_modules
 .git
 .github
 .claude
 wrangler.toml
 .assetsignore
 _facing_test.html
+package.json
+package-lock.json

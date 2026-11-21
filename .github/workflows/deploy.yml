@@ -21,18 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Passo temporário de diagnóstico: imprime o erro real em texto plano.
-      # Pode remover depois que o deploy estiver funcionando.
-      - name: Diagnóstico
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          echo "=== whoami ==="
-          npx wrangler@3.90.0 whoami || true
-          echo "=== deploy --dry-run ==="
-          npx wrangler@3.90.0 deploy --dry-run
-
       - name: Publicar no Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
