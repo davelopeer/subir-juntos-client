@@ -3,8 +3,9 @@
    O servidor manda a física; aqui apenas:
      - cuidamos do lobby (nome, criar/entrar, sala de espera);
      - lemos os inputs (teclado + toque) e enviamos ao servidor;
-     - desenhamos o mundo e os jogadores interpolando o estado
-       recebido para um movimento suave;
+     - prevemos o próprio boneco localmente (client-side prediction) e
+       interpolamos os remotos a partir do estado recebido, para um
+       movimento suave e responsivo mesmo com latência alta;
      - mostramos o HUD de altitude (metros).
    Arte e som reaproveitados do jogo original (canvas + Web Audio).
    ============================================================ */
@@ -68,6 +69,30 @@
   var lastSent = { left: false, right: false, jump: false };
   var keys = {};
 
+  // ---- Predição/interpolação (netcode) ------------------------------
+  // Física do jogador local — espelha server/src/room.js (passo a 60 Hz).
+  // Serve só para PREVER o próprio boneco entre snapshots; o servidor
+  // continua autoritativo e reconcilia a posição a cada estado recebido.
+  var PHYS = {
+    GRAVITY: 0.55,
+    MOVE_ACCEL: 0.9,
+    AIR_ACCEL: 0.6,
+    MAX_SPEED: 4.3,
+    FRICTION: 0.78,
+    JUMP_VEL: -13.4,
+    MAX_FALL: 16,
+    HW: 12, // meia-largura da "caixa" do personagem
+  };
+  var STEP_MS = 1000 / 60; // passo fixo da simulação local
+  var INTERP_DELAY = 100; // atraso de render p/ interpolar remotos (ms)
+  var SNAP_DIST = 64; // divergência (px) acima da qual damos snap
+  var RECONCILE_K = 0.2; // correção suave de drift por snapshot
+
+  var me = null; // estado físico previsto do jogador local
+  var buf = {}; // id -> histórico de snapshots p/ interpolar remotos
+  var simAcc = 0; // acumulador do passo fixo
+  var lastFrameTs = null;
+
   // ============================================================
   //  Rede
   // ============================================================
@@ -115,6 +140,10 @@
     });
     targets = {};
     rpos = {};
+    me = null;
+    buf = {};
+    simAcc = 0;
+    lastFrameTs = null;
     bestMeters = 0;
     milestone = 0;
     banner = { text: "", t: 0 };
@@ -131,13 +160,35 @@
     order = msg.players.map(function (p) {
       return p.id;
     });
+    var now = performance.now();
     msg.players.forEach(function (p) {
       targets[p.id] = p;
-      if (!rpos[p.id]) {
-        // primeira vez: aparece já na posição certa
-        rpos[p.id] = { x: p.x, y: p.y, facing: p.facing, bob: p.bob };
+      if (p.id === youId) {
+        // jogador local: inicia/reconcilia a previsão (Parte B).
+        if (!me) me = initMe(p);
+        else reconcile(me, p);
+        if (!rpos[p.id]) {
+          rpos[p.id] = {
+            x: p.x,
+            y: p.y,
+            facing: p.facing,
+            bob: p.bob,
+            vx: 0,
+            vy: 0,
+            grounded: p.grounded,
+          };
+        }
+        // o pulo do próprio boneco já soa na previsão; ignora o flag do
+        // servidor aqui para não tocar duas vezes.
+      } else {
+        // remotos: alimenta o buffer de interpolação (Parte C).
+        pushSample(p.id, now, p);
+        if (p.jumped) GameAudio.sfxJump();
+        if (!rpos[p.id]) {
+          // primeira vez: aparece já na posição certa
+          rpos[p.id] = { x: p.x, y: p.y, facing: p.facing, bob: p.bob };
+        }
       }
-      if (p.jumped) GameAudio.sfxJump();
     });
     if (msg.phase === "win" && phase !== "win") enterWin(msg.elapsed);
   });
@@ -898,37 +949,211 @@
   }
 
   // ============================================================
+  //  Predição local e interpolação dos remotos (netcode)
+  //  Parte B: a física do jogador local é prevista a 60 Hz aqui,
+  //  espelhando server/src/room.js, para o próprio boneco responder na
+  //  hora sem esperar o round-trip. O servidor continua autoritativo:
+  //  cada snapshot reconcilia a posição (blend suave; snap em corda/
+  //  hazard/respawn). Simplificação coop (sem PvP): sem replay de inputs.
+  // ============================================================
+  function resolvePlatformsLocal(pl) {
+    var hw = PHYS.HW;
+    pl.grounded = false;
+    var bottom = pl.y;
+    var prevBottom = pl.prevY;
+    var platforms = world.platforms;
+    for (var i = 0; i < platforms.length; i++) {
+      var p = platforms[i];
+      var top = p.y;
+      var overlapX = pl.x + hw > p.x && pl.x - hw < p.x + p.w;
+      if (!overlapX) continue;
+      // plataforma "um sentido": só aterrissa vindo de cima, caindo
+      if (pl.vy >= 0 && prevBottom <= top + 6 && bottom >= top) {
+        pl.y = top;
+        pl.vy = 0;
+        pl.grounded = true;
+      }
+    }
+  }
+
+  // Um passo de física do jogador local (sem corda/hazards — esses vêm
+  // da reconciliação com o servidor).
+  function stepLocalPlayer(p, inp) {
+    var accel = p.grounded ? PHYS.MOVE_ACCEL : PHYS.AIR_ACCEL;
+    if (inp.left && !inp.right) {
+      p.vx -= accel;
+      p.facing = -1;
+    } else if (inp.right && !inp.left) {
+      p.vx += accel;
+      p.facing = 1;
+    } else if (p.grounded) {
+      p.vx *= PHYS.FRICTION;
+      if (Math.abs(p.vx) < 0.05) p.vx = 0;
+    }
+    if (p.vx > PHYS.MAX_SPEED) p.vx = PHYS.MAX_SPEED;
+    if (p.vx < -PHYS.MAX_SPEED) p.vx = -PHYS.MAX_SPEED;
+
+    if (inp.jump && !p.jumpPrev && p.grounded) {
+      p.vy = PHYS.JUMP_VEL;
+      p.grounded = false;
+      GameAudio.sfxJump(); // feedback imediato do próprio pulo
+    }
+    p.jumpPrev = inp.jump;
+
+    p.vy += PHYS.GRAVITY;
+    if (p.vy > PHYS.MAX_FALL) p.vy = PHYS.MAX_FALL;
+
+    p.prevY = p.y;
+    p.x += p.vx;
+    p.y += p.vy;
+
+    var hw = PHYS.HW;
+    if (p.x < hw) {
+      p.x = hw;
+      if (p.vx < 0) p.vx = 0;
+    }
+    if (p.x > world.worldW - hw) {
+      p.x = world.worldW - hw;
+      if (p.vx > 0) p.vx = 0;
+    }
+    resolvePlatformsLocal(p);
+
+    if (p.grounded && Math.abs(p.vx) > 0.3) p.bob += 0.3;
+    else if (!p.grounded) p.bob += 0.08;
+  }
+
+  function initMe(p) {
+    return {
+      x: p.x,
+      y: p.y,
+      prevY: p.y,
+      vx: 0,
+      vy: 0,
+      grounded: p.grounded !== false,
+      jumpPrev: input.jump, // evita pulo fantasma se a tecla já está pressionada
+      facing: p.facing || 1,
+      bob: p.bob || 0,
+    };
+  }
+
+  // Reconcilia a previsão local com a posição autoritativa do servidor.
+  function reconcile(m, p) {
+    var dx = p.x - m.x;
+    var dy = p.y - m.y;
+    if (dx * dx + dy * dy > SNAP_DIST * SNAP_DIST) {
+      // divergência grande (corda/hazard/respawn): snap direto
+      m.x = p.x;
+      m.y = p.y;
+      m.prevY = p.y;
+      m.vx = 0;
+      m.vy = 0;
+      m.grounded = p.grounded !== false;
+    } else {
+      // drift normal: correção suave (facing/vx/vy seguem a previsão local)
+      m.x += dx * RECONCILE_K;
+      m.y += dy * RECONCILE_K;
+    }
+  }
+
+  // ---- Buffer de interpolação dos remotos (Parte C) ----------------
+  function pushSample(id, t, p) {
+    var b = buf[id] || (buf[id] = []);
+    b.push({
+      t: t,
+      x: p.x,
+      y: p.y,
+      facing: p.facing,
+      bob: p.bob,
+      grounded: p.grounded,
+    });
+    while (b.length > 2 && b[0].t < t - 1000) b.shift(); // ~1s de histórico
+  }
+
+  // Posição interpolada de um remoto no instante renderTime (atrasado).
+  function sampleBuffer(id, renderTime) {
+    var b = buf[id];
+    if (!b || !b.length) return rpos[id] || null;
+    if (renderTime <= b[0].t) {
+      var f = b[0];
+      return {
+        x: f.x,
+        y: f.y,
+        facing: f.facing,
+        bob: f.bob,
+        grounded: f.grounded,
+        vx: 0,
+        vy: 0,
+      };
+    }
+    for (var i = 0; i < b.length - 1; i++) {
+      var a = b[i];
+      var c = b[i + 1];
+      if (renderTime >= a.t && renderTime <= c.t) {
+        var span = c.t - a.t || 1;
+        var alpha = (renderTime - a.t) / span;
+        var pick = alpha < 0.5 ? a : c;
+        return {
+          x: a.x + (c.x - a.x) * alpha,
+          y: a.y + (c.y - a.y) * alpha,
+          bob: a.bob + (c.bob - a.bob) * alpha,
+          facing: pick.facing,
+          grounded: pick.grounded,
+          vx: c.x - a.x, // sinal/magnitude: andar vs. parado
+          vy: c.y - a.y, // sobe/desce: frame do pulo
+        };
+      }
+    }
+    var last = b[b.length - 1]; // starved: usa o mais recente
+    return {
+      x: last.x,
+      y: last.y,
+      facing: last.facing,
+      bob: last.bob,
+      grounded: last.grounded,
+      vx: 0,
+      vy: 0,
+    };
+  }
+
+  // ============================================================
   //  Loop principal
   // ============================================================
-  function frame() {
+  function frame(ts) {
     tick++;
+    if (ts == null) ts = performance.now();
+    var dt = lastFrameTs == null ? 0 : ts - lastFrameTs;
+    lastFrameTs = ts;
+    if (dt > 250) dt = 250; // após aba em 2º plano, evita "catch-up" enorme
 
     if ((phase === "playing" || phase === "win") && world) {
-      // interpolação suave rumo ao último estado recebido
+      // Parte B: avança a previsão do jogador local em passo fixo de 60 Hz.
+      if (phase === "playing" && me) {
+        simAcc += dt;
+        if (simAcc > 100) simAcc = 100; // limita a rajada de sub-passos
+        while (simAcc >= STEP_MS) {
+          stepLocalPlayer(me, input);
+          simAcc -= STEP_MS;
+        }
+      }
+      if (me) {
+        // o próprio boneco é desenhado a partir da previsão (responde na hora)
+        rpos[youId] = {
+          x: me.x,
+          y: me.y,
+          facing: me.facing,
+          bob: me.bob,
+          vx: me.vx,
+          vy: me.vy,
+          grounded: me.grounded,
+        };
+      }
+      // Parte C: remotos interpolados com atraso de render.
+      var renderTime = ts - INTERP_DELAY;
       for (var i = 0; i < order.length; i++) {
         var id = order[i];
-        var tgt = targets[id];
-        if (!tgt) continue;
-        if (!rpos[id])
-          rpos[id] = {
-            x: tgt.x,
-            y: tgt.y,
-            facing: tgt.facing,
-            bob: tgt.bob,
-            vx: 0,
-            vy: 0,
-            grounded: tgt.grounded,
-          };
-        var r = rpos[id];
-        var prevx = r.x,
-          prevy = r.y;
-        r.x += (tgt.x - r.x) * 0.35;
-        r.y += (tgt.y - r.y) * 0.35;
-        r.vx = r.x - prevx; // velocidade renderizada: define andar vs. parado
-        r.vy = r.y - prevy; // sobe/desce: escolhe o frame do pulo
-        r.bob = tgt.bob;
-        r.facing = tgt.facing;
-        r.grounded = tgt.grounded;
+        if (id === youId) continue;
+        var s = sampleBuffer(id, renderTime);
+        if (s) rpos[id] = s;
       }
       updateCameraAndMeters();
       renderPlay();
