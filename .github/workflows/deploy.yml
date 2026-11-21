@@ -1,13 +1,14 @@
-# Faz deploy deste repositório (site estático) no Cloudflare Pages
-# a cada push na branch main.
+# Faz deploy deste repositório (site estático) como Cloudflare Worker
+# (Static Assets) a cada push na branch main.
 #
 # Secrets necessários (no repo subir-juntos-client > Settings >
 # Secrets and variables > Actions > New repository secret):
-#   CLOUDFLARE_API_TOKEN   - token com permissão "Cloudflare Pages: Edit"
+#   CLOUDFLARE_API_TOKEN   - token com permissão "Workers Scripts: Edit"
 #   CLOUDFLARE_ACCOUNT_ID  - ID da sua conta Cloudflare
 #
-# O nome do projeto (--project-name) vira a URL: https://grudados.pages.dev
-name: Deploy (Cloudflare Pages)
+# O nome do Worker (em wrangler.toml) vira a URL:
+# https://subir-juntos-client.<subdominio>.workers.dev
+name: Deploy (Cloudflare Workers)
 
 on:
   push:
@@ -25,6 +26,6 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # "." publica a raiz do repo (index.html, js/, assets/, style.css).
-          # project-name precisa ser ÚNICO na sua conta Cloudflare.
-          command: pages deploy . --project-name=grudados --branch=main
+          # Usa o wrangler.toml da raiz (name + [assets]) para publicar
+          # o site estático como Worker com Static Assets.
+          command: deploy

@@ -1,0 +1,8 @@
+# Deploy do site estático como Cloudflare Worker (Static Assets).
+# A URL vira: https://subir-juntos-client.<seu-subdominio>.workers.dev
+name = "subir-juntos-client"
+compatibility_date = "2025-11-01"
+
+# Sem script de servidor: serve apenas os arquivos estáticos da raiz do repo.
+[assets]
+directory = "."
