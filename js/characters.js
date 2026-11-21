@@ -114,14 +114,6 @@ var CharSprites = (function () {
     if (frame < 0) frame = 0;
     if (frame >= n) frame = n - 1;
 
-    // sombra dos pes (nao espelha)
-    ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,0.20)";
-    ctx.beginPath();
-    ctx.ellipse(0, -1, 8.5, 2.5, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-
     ctx.save();
     ctx.scale(facing, 1); // espelha para a esquerda quando facing === -1
     ctx.imageSmoothingEnabled = true;
@@ -131,14 +123,31 @@ var CharSprites = (function () {
     ctx.restore();
   }
 
+  // Sombra no chao, desenhada na origem local (x do personagem, y do solo).
+  // factor em [0,1]: 1 = colado no chao, menor quando no ar (encolhe/clareia).
+  function drawShadow(ctx, factor) {
+    if (factor == null) factor = 1;
+    if (factor < 0) factor = 0;
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0," + (0.2 * factor).toFixed(3) + ")";
+    ctx.beginPath();
+    ctx.ellipse(
+      0,
+      -1,
+      8.5 * (0.6 + 0.4 * factor),
+      2.5 * factor,
+      0,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+    ctx.restore();
+  }
+
   // Desenho simples enquanto as imagens carregam (ou se falharem).
   function drawFallback(ctx, charIndex, facing) {
     var ch = CHARACTERS[charIndex] || { color: "#888" };
     ctx.save();
-    ctx.fillStyle = "rgba(0,0,0,0.18)";
-    ctx.beginPath();
-    ctx.ellipse(0, -1, 16, 5, 0, 0, Math.PI * 2);
-    ctx.fill();
     ctx.fillStyle = ch.color;
     roundCapsule(ctx, -11, -62, 22, 60, 11);
     ctx.fillStyle = "rgba(255,255,255,0.85)";
@@ -192,6 +201,7 @@ var CharSprites = (function () {
   return {
     load: load,
     drawFrame: drawFrame,
+    drawShadow: drawShadow,
     drawPreview: drawPreview,
     frameCount: frameCount,
     cycleFrame: cycleFrame,

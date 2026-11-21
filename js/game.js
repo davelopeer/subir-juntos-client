@@ -74,19 +74,29 @@
   // Serve só para PREVER o próprio boneco entre snapshots; o servidor
   // continua autoritativo e reconcilia a posição a cada estado recebido.
   var PHYS = {
-    GRAVITY: 0.55,
+    GRAVITY: 0.35,
     MOVE_ACCEL: 0.9,
     AIR_ACCEL: 0.6,
     MAX_SPEED: 4.3,
     FRICTION: 0.78,
-    JUMP_VEL: -13.4,
-    MAX_FALL: 16,
+    JUMP_VEL: -10.7,
+    MAX_FALL: 12.8,
     HW: 12, // meia-largura da "caixa" do personagem
+    // Corda: mesmos valores de server/src/room.js. A previsão local também
+    // aplica a mola (senão o jogador pendurado "cai" na previsão e o
+    // reconcile o puxa de volta a cada snapshot → looping sobe-e-desce).
+    ROPE_LEN: 120,
+    ROPE_K: 0.06,
+    ROPE_DAMP: 0.12,
   };
   var STEP_MS = 1000 / 60; // passo fixo da simulação local
   var INTERP_DELAY = 100; // atraso de render p/ interpolar remotos (ms)
-  var SNAP_DIST = 64; // divergência (px) acima da qual damos snap
-  var RECONCILE_K = 0.2; // correção suave de drift por snapshot
+  // Limiar de snap: só teleporta a previsão quando a divergência é enorme
+  // (renascimento move centenas de px). A esticada da corda e os trancos de
+  // perigo ficam abaixo disso e são absorvidos pelo blend suave — sem o
+  // "teleporte do nada" nem a travada de zerar a velocidade a cada snapshot.
+  var SNAP_DIST = 160; // divergência (px) acima da qual damos snap
+  var RECONCILE_K = 0.3; // correção suave de drift por snapshot (puxa mais rápido)
 
   var me = null; // estado físico previsto do jogador local
   var buf = {}; // id -> histórico de snapshots p/ interpolar remotos
@@ -795,6 +805,18 @@
         frame = CharSprites.cycleFrame(idx, "idle", now);
       }
 
+      // sombra fica no chão, mesmo durante o pulo: achamos a plataforma
+      // logo abaixo dos pés e desenhamos a sombra ali (encolhe com a altura).
+      var groundY = groundYUnder(p.x, p.y);
+      if (groundY != null) {
+        var height = groundY - p.y; // 0 no chão, cresce no ar
+        var factor = Math.max(0, 1 - height / 180);
+        ctx.save();
+        ctx.translate(p.x, groundY);
+        CharSprites.drawShadow(ctx, factor);
+        ctx.restore();
+      }
+
       ctx.save();
       ctx.translate(p.x, p.y);
       CharSprites.drawFrame(ctx, idx, anim, frame, p.facing);
@@ -956,6 +978,24 @@
   //  cada snapshot reconcilia a posição (blend suave; snap em corda/
   //  hazard/respawn). Simplificação coop (sem PvP): sem replay de inputs.
   // ============================================================
+  // Topo da plataforma mais próxima abaixo dos pés (x, feetY), p/ a sombra.
+  // Retorna null se não houver chão abaixo (fora de qualquer plataforma).
+  function groundYUnder(x, feetY) {
+    var platforms = world && world.platforms;
+    if (!platforms) return null;
+    var hw = PHYS.HW;
+    var best = null;
+    for (var i = 0; i < platforms.length; i++) {
+      var p = platforms[i];
+      var overlapX = x + hw > p.x && x - hw < p.x + p.w;
+      if (!overlapX) continue;
+      // plataforma deve estar no nível dos pés ou abaixo (com folga p/ o pulo)
+      if (p.y < feetY - 2) continue;
+      if (best == null || p.y < best) best = p.y;
+    }
+    return best;
+  }
+
   function resolvePlatformsLocal(pl) {
     var hw = PHYS.HW;
     pl.grounded = false;
@@ -976,8 +1016,42 @@
     }
   }
 
-  // Um passo de física do jogador local (sem corda/hazards — esses vêm
-  // da reconciliação com o servidor).
+  // Aplica a mola da corda na PREVISÃO do jogador local, igual ao servidor
+  // (room.js step()). O servidor aplica a cada par consecutivo da corrente a
+  // mesma força (em sentidos opostos) a cada ponta; então, para o jogador
+  // local, basta puxá-lo em direção a cada vizinho adjacente na ordem.
+  // Usa a posição RENDERIZADA dos vizinhos (rpos) — é o que o jogador vê.
+  function applyRopeLocal(p) {
+    if (order.length < 2) return;
+    var idx = order.indexOf(youId);
+    if (idx === -1) return;
+    var neighbors = [];
+    if (idx > 0) neighbors.push(order[idx - 1]);
+    if (idx < order.length - 1) neighbors.push(order[idx + 1]);
+    for (var n = 0; n < neighbors.length; n++) {
+      var np = rpos[neighbors[n]];
+      if (!np) continue;
+      var dx = np.x - p.x;
+      var dy = np.y - p.y;
+      var dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+      if (dist <= PHYS.ROPE_LEN) continue;
+      var nx = dx / dist;
+      var ny = dy / dist;
+      var stretch = dist - PHYS.ROPE_LEN;
+      var force = stretch * PHYS.ROPE_K;
+      // vizinho remoto: rpos guarda delta por snapshot (~2 ticks) → *0.5 p/
+      // aproximar a velocidade por tick usada no amortecimento.
+      var nvx = (np.vx || 0) * 0.5;
+      var nvy = (np.vy || 0) * 0.5;
+      var relV = (nvx - p.vx) * nx + (nvy - p.vy) * ny;
+      var totalF = force + relV * PHYS.ROPE_DAMP;
+      p.vx += nx * totalF;
+      p.vy += ny * totalF;
+    }
+  }
+
+  // Um passo de física do jogador local. Espelha room.js: inputs + gravidade,
+  // depois a corda, depois integração/colisão. (Perigos vêm da reconciliação.)
   function stepLocalPlayer(p, inp) {
     var accel = p.grounded ? PHYS.MOVE_ACCEL : PHYS.AIR_ACCEL;
     if (inp.left && !inp.right) {
@@ -1002,6 +1076,9 @@
 
     p.vy += PHYS.GRAVITY;
     if (p.vy > PHYS.MAX_FALL) p.vy = PHYS.MAX_FALL;
+
+    // corda (depois da gravidade, antes de integrar — ordem igual ao servidor)
+    applyRopeLocal(p);
 
     p.prevY = p.y;
     p.x += p.vx;
