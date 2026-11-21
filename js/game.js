@@ -143,7 +143,13 @@
     ROPE_DAMP: 0.12,
   };
   var STEP_MS = 1000 / 60; // passo fixo da simulação local
-  var INTERP_DELAY = 100; // atraso de render p/ interpolar remotos (ms)
+  // Atraso de render p/ interpolar remotos (ms). ADAPTATIVO: cresce quando a
+  // rede tem jitter (buffer maior absorve as rajadas → menos STARVE/travadas)
+  // e volta ao mínimo quando a rede está boa. Trocamos um pouco de latência
+  // visual por fluidez — o certo para um coop sem PvP.
+  var INTERP_DELAY = 110; // valor atual (ajustado 1x/s em frame())
+  var INTERP_DELAY_MIN = 110;
+  var INTERP_DELAY_MAX = 260;
   // Limiar de snap: só teleporta a previsão quando a divergência é enorme
   // (renascimento move centenas de px). A esticada da corda e os trancos de
   // perigo ficam abaixo disso e são absorvidos pelo blend suave — sem o
@@ -1005,7 +1011,9 @@
     if (diag.fps < 30 || diag.jankShown > 100)
       return ["aparelho (render)", "#ff6b6b"];
     if (s.server && s.server.simGap > 20) return ["servidor (loop)", "#ff6b6b"];
-    if (diag.jitter > 35 || diag.starveRate > 2 || diag.stateRate < 20)
+    // "rede" só quando o buffer REALMENTE falhou (starve) ou há perda de
+    // pacotes sustentada — não a cada pico de jitter, que o buffer absorve.
+    if (diag.starveRate > 1 || diag.stateRate < 18 || diag.jitter > 60)
       return ["rede (jitter/perda)", "#ffe14d"];
     if (diag.snapRate > 1) return ["previsão (snap)", "#ffe14d"];
     if (s.ping != null && s.pingAvg > 160)
@@ -1048,18 +1056,23 @@
     lines.push([
       "JITTER",
       diag.jitter + " ms",
-      diagColor(diag.jitter, 15, 35, true),
+      diagColor(diag.jitter, 25, 50, true),
     ]);
     lines.push([
       "TRAVA",
       Math.round(diag.gapMaxShown) + " ms",
-      diagColor(diag.gapMaxShown, 80, 200, true),
+      diagColor(diag.gapMaxShown, 100, 250, true),
     ]);
 
     // --- netcode (previsão + interpolação) ---
     lines.push([
       "STARVE",
-      diag.starveRate + "/s   buf " + diag.bufDepth,
+      diag.starveRate +
+        "/s  buf " +
+        diag.bufDepth +
+        "  atraso " +
+        Math.round(INTERP_DELAY) +
+        "ms",
       diagColor(diag.starveRate, 0, 2, true),
     ]);
     lines.push([
@@ -1429,17 +1442,18 @@
     if (dt > diag.jankMax) diag.jankMax = dt;
     if (dt > 250) dt = 250; // após aba em 2º plano, evita "catch-up" enorme
 
-    // Relógio de render suave: avança por tempo real e segue de perto o tick
-    // do servidor (extrapolando desde o último snapshot). Sem o serrilhado do
-    // antigo `tick++`, que fazia nuvens/perigos pularem a cada snapshot.
+    // Relógio de render suave. REGRA: o movimento vem do avanço por TEMPO REAL
+    // (≈1 tick/quadro, idêntico aos 60 fps); o servidor só corrige a DERIVA,
+    // devagar. A versão anterior usava só um LERP até o alvo — como o alvo
+    // cresce ~1/quadro e o snap era em 8, a diferença subia e "pulava"
+    // (dente-de-serra) → nuvens/pássaros picotados. Agora não há salto.
+    renderTick += dt / STEP_MS; // avanço suave por tempo real
     if (serverTickAt) {
-      var tgt = serverTick + (ts - serverTickAt) / STEP_MS;
-      var dTick = tgt - renderTick;
-      if (dTick > 8 || dTick < -8)
-        renderTick = tgt; // resync duro (aba voltou / lag grande)
-      else renderTick += dTick * 0.1; // aproxima suave
-    } else {
-      renderTick += dt / STEP_MS; // antes do 1º snapshot
+      var target = serverTick + (ts - serverTickAt) / STEP_MS;
+      var err = target - renderTick;
+      if (err > 20 || err < -20)
+        renderTick = target; // resync duro (aba em 2º plano / lag grande)
+      else renderTick += err * 0.03; // correção de deriva imperceptível
     }
 
     // Amostragem das métricas de diagnóstico, uma vez por segundo.
@@ -1467,6 +1481,14 @@
       }
       diag.starveRate = Math.round(diag.starveCount / secs);
       diag.snapRate = Math.round(diag.snapCount / secs);
+      // atraso de interpolação adaptativo: cobre ~2 snapshots + folga do jitter.
+      // Se houve STARVE, puxa mais agressivo (o buffer esvaziou de fato).
+      var targetDelay = 90 + diag.jitter * 2.5 + diag.starveRate * 25;
+      if (targetDelay < INTERP_DELAY_MIN) targetDelay = INTERP_DELAY_MIN;
+      if (targetDelay > INTERP_DELAY_MAX) targetDelay = INTERP_DELAY_MAX;
+      // sobe rápido (evita travar já), desce devagar (não "repuxa" os remotos).
+      var k = targetDelay > INTERP_DELAY ? 0.5 : 0.1;
+      INTERP_DELAY += (targetDelay - INTERP_DELAY) * k;
       // BUFFER: profundidade média dos buffers de interpolação dos remotos.
       var bSum = 0,
         bN = 0;
